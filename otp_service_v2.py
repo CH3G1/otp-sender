@@ -175,7 +175,7 @@ button:hover{filter:brightness(1.1);transform:translateY(-1px);}
 <body>
 <div class="box">
   <div class="logo">&#9993;</div>
-  <h1>OTP Sender v2.0</h1>
+  <h1>OTP Sender v2.0.2</h1>
   <p class="sub">Enter your access credentials to continue</p>
   <div class="err">""" + """ + msg + """ + """</div>
   <form method="POST" action="/login">
@@ -194,7 +194,7 @@ def build_html():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>OTP Sender v2.0</title>
+<title>OTP Sender v2.0.2</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -402,7 +402,7 @@ textarea::placeholder{color:var(--mu)}
 <!-- TOP BAR -->
 <div class="topbar">
   <div class="logo">&#9993;</div>
-  <div class="brand">OTP Sender <span>v2.0</span></div>
+  <div class="brand">OTP Sender <span>v2.0.2</span></div>
   <div class="topbar-right">
     <div class="tok-pill" onclick="manualRefresh()" title="Session sync">
       &#8635; Session: <span id="tokTimer">55:00</span>
@@ -908,7 +908,7 @@ if __name__ == "__main__":
 
     print("")
     print("  ╔══════════════════════════════════════════╗")
-    print("  ║        OTP Sender v2.0  — Ready          ║")
+    print("  ║        OTP Sender v2.0.2  — Ready          ║")
     print("  ╠══════════════════════════════════════════╣")
     if HOST == "localhost":
         print("  ║   URL  : http://localhost:%d          ║" % PORT)
