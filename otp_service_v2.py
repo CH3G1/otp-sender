@@ -24,22 +24,23 @@ import zlib
 import threading
 import time
 import os
+import hashlib
+import hmac
 
-# ── Visible config ──────────────────────────────────────────────────
-APP_ID    = "8329815A6D1AE6DD"
-API_TOKEN = "xZrynrGkhJl003tBA0Pu72rmBRldWtWoI6VKTiMzfqiW8508HxUHAbszs0Wr"
-PORT      = int(os.environ.get("PORT", 7777))   # Railway sets PORT env var
-
-# ── Password (change this to whatever you want) ─────────────────────
-LOGIN_PASSWORD = os.environ.get("APP_PASSWORD", "sheba2024")
+# ── Config loaded from environment variables (never hardcoded) ──────
+APP_ID         = os.environ.get("APP_ID",       "")
+API_TOKEN      = os.environ.get("API_TOKEN",    "")
+PORT           = int(os.environ.get("PORT",     7777))
+LOGIN_PASSWORD = os.environ.get("APP_PASSWORD", "changeme")
 
 # ── Session store (in-memory) ───────────────────────────────────────
 import secrets as _secrets
-_sessions = set()   # active session tokens
+_sessions     = {}   # sid -> expiry timestamp
+SESSION_TTL   = 8 * 3600  # 8 hours
 
 def _new_session():
     tok = _secrets.token_hex(32)
-    _sessions.add(tok)
+    _sessions[tok] = time.time() + SESSION_TTL
     return tok
 
 def _valid_session(cookie_header):
@@ -47,8 +48,57 @@ def _valid_session(cookie_header):
     for part in cookie_header.split(";"):
         part = part.strip()
         if part.startswith("sid="):
-            return part[4:] in _sessions
+            sid = part[4:]
+            expiry = _sessions.get(sid)
+            if expiry and time.time() < expiry:
+                _sessions[sid] = time.time() + SESSION_TTL  # refresh
+                return True
+            elif expiry:
+                del _sessions[sid]  # expired — remove
     return False
+
+def _purge_sessions():
+    """Remove expired sessions periodically."""
+    now = time.time()
+    expired = [k for k, v in _sessions.items() if v < now]
+    for k in expired:
+        del _sessions[k]
+
+# ── Brute force protection ──────────────────────────────────────────
+_login_attempts = {}   # ip -> [timestamp, count]
+MAX_ATTEMPTS    = 5    # max failed attempts
+LOCKOUT_TIME    = 300  # 5 minute lockout
+
+def _check_rate_limit(ip):
+    """Returns (allowed, seconds_remaining)"""
+    now = time.time()
+    if ip not in _login_attempts:
+        return True, 0
+    attempts = _login_attempts[ip]
+    # Reset if lockout period passed
+    if now - attempts["last"] > LOCKOUT_TIME:
+        del _login_attempts[ip]
+        return True, 0
+    if attempts["count"] >= MAX_ATTEMPTS:
+        remaining = int(LOCKOUT_TIME - (now - attempts["last"]))
+        return False, remaining
+    return True, 0
+
+def _record_failed_attempt(ip):
+    now = time.time()
+    if ip not in _login_attempts:
+        _login_attempts[ip] = {"count": 1, "last": now}
+    else:
+        _login_attempts[ip]["count"] += 1
+        _login_attempts[ip]["last"] = now
+
+def _clear_attempts(ip):
+    if ip in _login_attempts:
+        del _login_attempts[ip]
+
+def _safe_compare(a, b):
+    """Constant-time string comparison to prevent timing attacks."""
+    return hmac.compare_digest(a.encode(), b.encode())
 # ───────────────────────────────────────────────────────────────────
 
 def _d(b): return zlib.decompress(base64.b64decode(b)).decode()
@@ -98,7 +148,7 @@ _refresh_thread.start()
 print(f"  [SYS] Auto-sync scheduled every 55 min")
 
 
-def build_login(error=False):
+def build_login(error=False, msg="Incorrect password. Try again."):
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -127,7 +177,7 @@ button:hover{filter:brightness(1.1);transform:translateY(-1px);}
   <div class="logo">&#9993;</div>
   <h1>OTP Sender v2.0</h1>
   <p class="sub">Enter your access credentials to continue</p>
-  <div class="err">Incorrect password. Try again.</div>
+  <div class="err">""" + """ + msg + """ + """</div>
   <form method="POST" action="/login">
     <label>Password</label>
     <input type="password" name="password" placeholder="Enter password" autofocus>
@@ -622,6 +672,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print("  %s - %s" % (self.address_string(), fmt % args))
 
+    def _ip(self):
+        # Support Railway proxy headers
+        return (self.headers.get("X-Forwarded-For", "") or
+                self.headers.get("X-Real-IP", "") or
+                self.address_string()).split(",")[0].strip()
+
     def _is_auth(self):
         return _valid_session(self.headers.get("Cookie", ""))
 
@@ -630,67 +686,67 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Location", "/login")
         self.end_headers()
 
+    def _add_security_headers(self):
+        self.send_header("X-Content-Type-Options",  "nosniff")
+        self.send_header("X-Frame-Options",          "DENY")
+        self.send_header("X-XSS-Protection",         "1; mode=block")
+        self.send_header("Referrer-Policy",           "no-referrer")
+        self.send_header("Cache-Control",             "no-store, no-cache, must-revalidate")
+        self.send_header("Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src https://fonts.gstatic.com; "
+            "connect-src 'self'; "
+            "img-src 'self' data:; "
+            "frame-ancestors 'none'")
+
     def _send_html(self, html, status=200):
         page = html.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(page)))
+        self._add_security_headers()
         self.end_headers()
         self.wfile.write(page)
 
     def do_GET(self):
-        # Login page — always accessible
         if self.path == "/login":
             self._send_html(build_login())
             return
-        # Favicon — skip auth
         if self.path == "/favicon.ico":
             self.send_response(204)
             self.end_headers()
             return
-        # All other routes require auth
         if not self._is_auth():
             self._redirect_login()
             return
         if self.path == "/token-status":
-            elapsed  = int(time.time() - _token_refreshed_at[0])
+            elapsed   = int(time.time() - _token_refreshed_at[0])
             remaining = max(0, TOKEN_LIFETIME - elapsed)
-            out = json.dumps({"next_refresh_in": remaining, "elapsed": elapsed}).encode("utf-8")
+            out = json.dumps({"next_refresh_in": remaining}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(out)))
+            self._add_security_headers()
             self.end_headers()
             self.wfile.write(out)
             return
+        # Purge expired sessions occasionally
+        _purge_sessions()
         self._send_html(build_html())
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin",  "*")
         self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
     def do_POST(self):
-        # Login form submit
         if self.path == "/login":
-            length = int(self.headers.get("Content-Length", 0))
-            body   = self.rfile.read(length).decode("utf-8")
-            params = {}
-            for part in body.split("&"):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    params[k] = urllib.parse.unquote_plus(v)
-            if params.get("password") == LOGIN_PASSWORD:
-                sid = _new_session()
-                self.send_response(302)
-                self.send_header("Location", "/")
-                self.send_header("Set-Cookie", "sid=%s; Path=/; HttpOnly; SameSite=Strict" % sid)
-                self.end_headers()
-            else:
-                self._send_html(build_login(error=True))
+            self._handle_login()
             return
-        # All other POST routes require auth
         if not self._is_auth():
             self._send_json({"success": False, "error": "Unauthorized"})
             return
@@ -701,6 +757,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _handle_login(self):
+        ip = self._ip()
+        allowed, wait = _check_rate_limit(ip)
+        if not allowed:
+            self._send_html(build_login(
+                error=True,
+                msg="Too many attempts. Try again in %d seconds." % wait
+            ))
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        # Reject oversized bodies
+        if length > 512:
+            self._send_html(build_login(error=True, msg="Invalid request."))
+            return
+
+        body   = self.rfile.read(length).decode("utf-8", errors="ignore")
+        params = {}
+        for part in body.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                params[k] = urllib.parse.unquote_plus(v)
+
+        pwd = params.get("password", "")
+
+        if _safe_compare(pwd, LOGIN_PASSWORD):
+            _clear_attempts(ip)
+            sid = _new_session()
+            self.send_response(302)
+            self.send_header("Location", "/")
+            self.send_header(
+                "Set-Cookie",
+                "sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d" % (sid, SESSION_TTL)
+            )
+            self.end_headers()
+        else:
+            _record_failed_attempt(ip)
+            _, remaining_attempts = _check_rate_limit(ip)
+            left = MAX_ATTEMPTS - _login_attempts.get(ip, {}).get("count", 0)
+            msg = "Incorrect password. %d attempt(s) left." % max(0, left) if left > 0 else "Account locked. Try later."
+            self._send_html(build_login(error=True, msg=msg))
 
     def _send_json(self, data):
         out = json.dumps(data).encode("utf-8")
@@ -713,17 +811,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _handle_proxy(self):
         length = int(self.headers.get("Content-Length", 0))
-        body   = json.loads(self.rfile.read(length))
-        # credentials injected server-side — never from browser
+        # Reject oversized bodies
+        if length > 1024:
+            self._send_json({"success": False, "error": "Invalid request"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length))
+        except Exception:
+            self._send_json({"success": False, "error": "Invalid JSON"})
+            return
+
+        mobile = str(body.get("mobile", "")).strip()
+
+        # Validate mobile number format — must be +880 BD number
+        import re
+        if not re.match(r"^\+8801[3-9]\d{8}$", mobile):
+            self._send_json({"success": False, "error": "Invalid mobile number format"})
+            return
+
         payload = {
-            "mobile":    body.get("mobile", ""),
+            "mobile":    mobile,
             "app_id":    APP_ID,
             "api_token": _current_token[0]
         }
         self._send_json(self._forward(payload))
 
     def _handle_refresh(self):
-        # app_id always from server — never from browser
         result = refresh_token(APP_ID)
         self._send_json(result)
 
