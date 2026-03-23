@@ -811,7 +811,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _handle_proxy(self):
         length = int(self.headers.get("Content-Length", 0))
-        # Reject oversized bodies
         if length > 1024:
             self._send_json({"success": False, "error": "Invalid request"})
             return
@@ -823,7 +822,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         mobile = str(body.get("mobile", "")).strip()
 
-        # Validate mobile number format — must be +880 BD number
         import re
         if not re.match(r"^\+8801[3-9]\d{8}$", mobile):
             self._send_json({"success": False, "error": "Invalid mobile number format"})
@@ -834,11 +832,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "app_id":    APP_ID,
             "api_token": _current_token[0]
         }
-        self._send_json(self._forward(payload))
+        result = self._forward(payload)
+
+        # Strip ALL sensitive fields before sending to browser
+        STRIP_KEYS = {"token", "api_token", "app_id", "access_token",
+                      "raw", "key", "secret", "auth", "authorization"}
+        safe = {k: v for k, v in result.items() if k.lower() not in STRIP_KEYS}
+        self._send_json(safe)
 
     def _handle_refresh(self):
         result = refresh_token(APP_ID)
-        self._send_json(result)
+        # NEVER send token to browser — strip it completely
+        safe = {"success": result.get("success", False)}
+        if not safe["success"]:
+            safe["error"] = result.get("error", "Sync failed")
+        self._send_json(safe)
 
     def _forward(self, payload):
         data = json.dumps(payload).encode("utf-8")
